@@ -1,0 +1,110 @@
+
+# Original selection probabilities
+g <- grpreg(x, y, group = group_ids, penalty = c('grMCP'), nlambda = 20, family = "binomial", lambda.min = 0.05)
+
+
+Gq_lambda <- numeric(length(lam))
+
+lam <- seq(0.1, 0.5, length = 20)
+for (j in 1:K) {
+  s1 <- sample(1:n, floor(n/2))
+  g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grSCAD'), lambda = lam, family = "binomial")
+  bhat1 <- as.matrix(g1$beta[-1,])
+  bhat1[bhat1 != 0] <- 1
+  q_lambda <- q_lambda + colSums(bhat1)
+}
+
+q_lambda <- q_lambda / K
+
+# FDR 설정 및 θ 계산
+FDR <- 0.005  # 허용할 최대 오류 비율
+theta <- ceiling(FDR * p)  # 전체 변수 수의 5%를 θ로 설정
+
+# πθ 계산
+pi_theta <- (q_lambda^2) / (2 * theta * p) + 0.5
+n_beta_cv <- numeric(p)
+n_beta_ds <- numeric(p)
+n_beta_sp <- numeric(p)
+
+Result_grSCAD <- matrix(0, N, 3)
+lam_grSCAD <- NULL 
+
+for(i in 1:N){
+  
+  set.seed(123+i)
+  
+  #cv
+  
+  # cv_grpreg 사용하여 그룹 LASSO 모델 피팅 및 교차 검증
+  cv_fit <- cv.grpreg(x, y, group = group_ids, lambda = lam, penalty = c('grSCAD'), family = "binomial")
+  
+  # 최적의 람다 값 확인
+  best_lambda <- cv_fit$lambda.min
+  
+  final_model <- grpreg(x, y, group = group_ids, penalty = c('grSCAD'), family = "binomial", lambda = best_lambda)
+  
+  nvar_cv <- sum(final_model$beta[-1] != 0)
+  
+  n_beta_cv <- n_beta_cv + as.numeric(final_model$beta[-1] != 0)
+  
+  lam_grSCAD <- c(lam_grSCAD, best_lambda)
+  
+  #DS
+  
+  train_indices <- sample(1:n, floor(0.7*n))
+  train_x <- x[train_indices, ]
+  test_x <- x[-train_indices, ]
+  
+  train_y <- y[train_indices]
+  test_y <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- grpreg(train_x, train_y, group = group_ids, lambda = lam, penalty = c('grSCAD'), family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  dv_pred <- predict(ds_model, test_x, type = 'response')
+  dv_pred <- ifelse(dv_pred > 0.5, 1, 0)
+  mse <- colMeans((dv_pred - as.numeric(test_y)) ^ 2)
+  
+  # 최적의 람다 값 선택
+  best_lambda_ds <- ds_model$lambda[which.min(mse)]
+  
+  # 최적의 람다 값으로 최종 모델 적합
+  final_model_ds <- grpreg(x, y, group = group_ids, penalty = c('grSCAD'), family = "binomial", lambda = best_lambda_ds)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta[-1] != 0)
+  
+  n_beta_ds <- n_beta_ds + as.numeric(final_model_ds$beta[-1] != 0)
+  
+  lam_grSCAD <- c(lam_grSCAD, best_lambda_ds)
+  
+  #SP
+  
+  
+  # 선택 확률 기반 변수 선택
+  SF <- matrix(0, p, length(lam))
+  
+  for (j in 1:K) {
+    s1 <- sample(1:n, floor(n/2))
+    g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grSCAD'), lambda = lam , family = "binomial")
+    bhat1 <- as.matrix(g1$beta[-1,])
+    bhat1[bhat1 != 0] <- 1
+    SF <- SF + bhat1
+  }
+  
+  S <- SF / K
+  SP <- apply(S, 1, max)
+  
+  # 변수 선택
+  nvar_sp <- sum(SP >= pi_theta)
+  
+  n_beta_sp <- n_beta_sp + as.numeric(SP >= pi_theta)
+  
+  Result_grSCAD[i,] = c(nvar_cv, nvar_ds, nvar_sp)
+  
+  print(paste("Finish :", i))
+}
+
+Result_grSCAD
+grSCAD_beta_1 <- rbind(n_beta_cv,n_beta_ds,n_beta_sp)

@@ -1,0 +1,550 @@
+# 필요한 라이브러리 설치 및 로드
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("GEOquery")
+BiocManager::install("limma")
+install.packages("glmnet")
+
+install.packages("gglasso")
+library(gglasso)
+
+library(GEOquery)
+library(limma)
+library(glmnet)
+
+
+# Affymetrix 플랫폼의 경우, 유전자 심볼을 얻기 위해 hgu133a.db 패키지를 사용할 수 있습니다.
+BiocManager::install("hgu133plus2.db")
+library(Biobase)
+library(hgu133plus2.db)
+library(AnnotationDbi)
+
+probe1 <- colnames(x_1)
+probe2 <- colnames(x_2)
+
+sum(probe1 != probe2)
+
+probe <- probe2
+
+# 프로브 ID에 대한 유전자 심볼과 엔트레즈 ID 가져오기
+# probe ID를 유전자 심볼로 변환
+gene_symbols <- mapIds(hgu133plus2.db, keys = probe, column = "SYMBOL", keytype = "PROBEID")
+
+
+#데이터 전처리
+
+# GEO 데이터 다운로드
+gse1 <- getGEO("GDS3952", GSEMatrix = TRUE)
+gds <- GDS2eSet(gse1)
+
+# gse2 <- getGEO("GDS3853", GSEMatrix = TRUE)
+# gds2 <- GDS2eSet(gse2)
+
+# 데이터 준비
+expr_data <- exprs(gds)
+pheno_data <- pData(gds)
+
+# # 데이터 준비
+# expr_data22 <- exprs(gds2)
+# pheno_data22 <- pData(gds2)
+
+
+# 유효한 유전자 심볼만 필터링
+valid_genes <- !is.na(gene_symbols)
+gene_symbols <- gene_symbols[valid_genes]
+
+# 유전자 심볼로 그룹 ID 생성
+unique_genes <- unique(gene_symbols)
+group_ids <- match(gene_symbols, unique_genes)
+
+
+y_1 <- as.factor(pheno_data$disease.state)
+levels(y_1) <- c(1:6)
+sam <- which(y_1 %in% c(3,4,6))
+y_1 <- as.numeric(y_1[sam])
+y_1 <- ifelse(y_1 %in% 3, 0, 1)
+x_1 <- t(expr_data)
+
+# x_2 <- t(expr_data22)
+# y_2 <- as.factor(pheno_data22$disease.state)
+# y_2 <- as.numeric(y_2)
+# 
+# x_2 <- x_2[y_2 != 2, ]
+# y_2 <- y_2[y_2 != 2]
+# y_2 <- ifelse(y_2 %in% 3, 1, 0)
+
+
+
+
+x <- x_1[sam, valid_genes]
+# x_2 <- x_2[, valid_genes]
+
+y <- y_1
+# x <- rbind(x,x_2)
+# y <- c(y, y_2)
+
+# 데이터프레임으로 병합
+data <- rbind(group_ids,x)
+
+# 첫 번째 행을 기준으로 열 순서 정렬
+sorted_indices <- order(data[1, ])
+x <- data[-1, sorted_indices]
+group_ids <- data[1, sorted_indices]
+
+
+if (!requireNamespace("grpreg", quietly = TRUE)) {
+  install.packages("grpreg")
+}
+library(grpreg)
+
+# group Lasso
+
+N <- 50
+p <- ncol(x)
+n <- nrow(x)
+K <- 20
+
+# Original selection probabilities
+g <- grpreg(x, y, group = group_ids, penalty = c('grLasso'), nlambda = 20 , family = "binomial")
+lam <- g$lambda[seq(1, length(g$lambda), 2)]
+
+q_lambda <- numeric(length(lam))
+
+for (j in 1:K) {
+  s1 <- sample(1:n, floor(n/2))
+  g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grLasso'), lambda = lam , family = "binomial")
+  bhat1 <- as.matrix(g1$beta)
+  bhat1[bhat1 != 0] <- 1
+  q_lambda <- q_lambda + colSums(bhat1)
+}
+
+q_lambda <- q_lambda / K
+
+
+# FDR 설정 및 θ 계산
+FDR <- 0.05  # 허용할 최대 오류 비율
+theta <- ceiling(FDR * p)  # 전체 변수 수의 5%를 θ로 설정
+
+
+# πθ 계산
+pi_theta <- (q_lambda^2) / (2 * theta * p) + 0.5
+
+Result_grlasso <- matrix(0, N, 3)
+
+for(i in 1:N){
+  
+  set.seed(123+i)
+
+  #cv
+  
+  # cv_grpreg 사용하여 그룹 LASSO 모델 피팅 및 교차 검증
+  cv_fit <- cv.grpreg(x, y, group = group_ids, nlambda = 20, penalty = c('grLasso'), family = "binomial")
+  
+  # 최적의 람다 값 확인
+  best_lambda <- cv_fit$lambda.min
+  final_model <- grpreg(x, y, group = group_ids, penalty = c('grLasso'), family = "binomial", lambda = best_lambda)
+  
+  nvar_cv <- sum(final_model$beta[-1] != 0)
+  
+  
+  #DS
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x <- x[train_indices, ]
+  test_x <- x[-train_indices, ]
+  
+  train_y <- y[train_indices]
+  test_y <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- grpreg(train_x, train_y, group = group_ids, nlambda = 20, penalty = c('grLasso'), family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  dv_pred <- predict(ds_model, test_x, type = 'response')
+  mse <- colMeans((dv_pred - as.numeric(test_y)) ^ 2)
+  
+  # 최적의 람다 값 선택
+  best_lambda_ds <- ds_model$lambda[which.min(mse)]
+  
+  # 최적의 람다 값으로 최종 모델 적합
+  final_model_ds <- grpreg(x, y, group = group_ids, penalty = c('grLasso'), family = "binomial", lambda = best_lambda_ds)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta[-1] != 0)
+  
+  
+  
+  #SP
+  
+  
+  # 선택 확률 기반 변수 선택
+  SF <- matrix(0, p, length(lam))
+  
+  for (j in 1:K) {
+    s1 <- sample(1:n, floor(n/2))
+    g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grLasso'), lambda = lam , family = "binomial")
+    bhat1 <- as.matrix(g1$beta[-1,])
+    bhat1[bhat1 != 0] <- 1
+    SF <- SF + bhat1
+  }
+  
+  S <- SF / K
+  SP <- apply(S, 1, max)
+  
+  # 변수 선택
+  nvar_sp <- sum(SP >= pi_theta)
+  Result_grlasso[i,] = c(nvar_cv, nvar_ds, nvar_sp)
+}
+
+#Group MCP
+
+
+
+# Original selection probabilities
+g <- grpreg(x, y, group = group_ids, penalty = c('grMCP'), nlambda = 20 , family = "binomial")
+lam <- g$lambda[seq(1, length(g$lambda), 2)]
+
+q_lambda <- numeric(length(lam))
+
+for (j in 1:K) {
+  s1 <- sample(1:n, floor(n/2))
+  g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grMCP'), lambda = lam, family = "binomial")
+  bhat1 <- as.matrix(g1$beta)
+  bhat1[bhat1 != 0] <- 1
+  q_lambda <- q_lambda + colSums(bhat1)
+}
+
+q_lambda <- q_lambda / K
+
+
+# FDR 설정 및 θ 계산
+FDR <- 0.05  # 허용할 최대 오류 비율
+theta <- ceiling(FDR * p)  # 전체 변수 수의 5%를 θ로 설정
+
+
+# πθ 계산
+pi_theta <- (q_lambda^2) / (2 * theta * p) + 0.5
+
+Result_grMCP <- matrix(0, N, 3)
+for(i in 1:N){
+  
+  set.seed(123+i)
+  #cv
+  
+  
+  # cv_grpreg 사용하여 그룹 LASSO 모델 피팅 및 교차 검증
+  cv_fit <- cv.grpreg(x, y, group = group_ids, nlambda = 20, penalty = c('grMCP'), family = "binomial")
+  
+  # 최적의 람다 값 확인
+  best_lambda <- cv_fit$lambda.min
+  final_model <- grpreg(x, y, group = group_ids, penalty = c('grMCP'), family = "binomial", lambda = best_lambda)
+  
+  nvar_cv <- sum(final_model$beta[-1] != 0)
+  
+  
+  #DS
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x <- x[train_indices, ]
+  test_x <- x[-train_indices, ]
+  
+  train_y <- y[train_indices]
+  test_y <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- grpreg(train_x, train_y, group = group_ids, nlambda = 20, penalty = c('grMCP'), family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  dv_pred <- predict(ds_model, test_x, type = 'response')
+  mse <- colMeans((dv_pred - as.numeric(test_y)) ^ 2)
+  
+  # 최적의 람다 값 선택
+  best_lambda_ds <- ds_model$lambda[which.min(mse)]
+  
+  # 최적의 람다 값으로 최종 모델 적합
+  final_model_ds <- grpreg(x, y, group = group_ids, penalty = c('grMCP'), family = "binomial", lambda = best_lambda_ds)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta[-1] != 0)
+  
+  
+  
+  #SP
+  
+  # 선택 확률 기반 변수 선택
+  SF <- matrix(0, p, length(lam))
+  
+  for (j in 1:K) {
+    s1 <- sample(1:n, floor(n/2))
+    g1 <- grpreg(x[s1,], y[s1], group = group_ids, penalty = c('grMCP'), lambda = lam , family = "binomial")
+    bhat1 <- as.matrix(g1$beta[-1,])
+    bhat1[bhat1 != 0] <- 1
+    SF <- SF + bhat1
+  }
+  
+  S <- SF / K
+  SP <- apply(S, 1, max)
+  
+  # 변수 선택
+  nvar_sp <- sum(SP >= pi_theta)
+  Result_grMCP[i,] = c(nvar_cv, nvar_ds, nvar_sp)
+}
+
+
+  
+  
+  
+  
+#Elastic Net
+
+alp <- seq(0, 1, 0.1)  # 예시로 알파 값을 0에서 1로 설정
+alp_mat <- matrix(0, length(alp), 10)
+alp_mm <- matrix(0, length(alp), 10)
+
+for(j in 1:10){
+  for(i in 1:length(alp)){
+    cv_model <- cv.glmnet(as.matrix(x), y, family = "binomial",type.measure="class", alpha = alp[i])
+    alp_mat[i,j] <- min(cv_model$cvm)  # 가장 작은 교차 검증 오류 값을 선택
+  }
+}
+
+alp <- alp[which.min(apply(alp_mat,1,mean))]
+
+Result_Elastic <- matrix(0, N, 3)
+
+SP_n_Elastic <- c(1:N)
+
+for(i in 1:N){
+
+  #CV
+  # 10-fold 교차 검증을 사용한 라소 회귀
+  set.seed(i)
+  cv_model <- cv.glmnet(as.matrix(x), y, family = "binomial", type.measure="class", alpha = alp)
+  
+  # 최적의 람다 값
+  best_lambda_cv <- cv_model$lambda.min
+  
+  # 최적의 람다 값으로 모델 적합
+  final_model_cv <- glmnet(as.matrix(x), y, family = "binomial", alpha = alp, lambda = best_lambda_cv)
+  
+  # 최적의 모델 계수
+  nvar_cv <- sum(final_model_cv$beta[-1] != 0) 
+  
+  
+  
+  #Ds
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x <- x[train_indices, ]
+  test_x <- x[-train_indices, ]
+  
+  train_y <- y[train_indices]
+  test_y <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- glmnet(train_x, train_y, family = "binomial", alpha = alp, nlambda = 20)
+  
+  # 테스트 세트에서 성능 평가
+  dv_pred <- predict(ds_model, newx = test_x, type = 'response')
+  mse <- colMeans((dv_pred - as.numeric(test_y)) ^ 2)
+  
+  # 최적의 람다 값 선택
+  best_lambda_ds <- ds_model$lambda[which.min(mse)]
+  
+  # 최적의 람다 값으로 최종 모델 적합
+  final_model_ds <- glmnet(as.matrix(x), y, family = "binomial", alpha = alp, lambda = best_lambda_ds)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta[-1] != 0)
+  
+  
+  #SP
+  
+  # 부트스트랩 샘플 수
+  B <- 100
+  selected_vars <- matrix(0, ncol = ncol(x), nrow = B)
+  
+  # 부트스트랩 반복
+  for (b in 1:B) {
+    set.seed(123 + i + b)
+    boot_idx <- sample(1:nrow(x), size = nrow(x), replace = TRUE)
+    X_boot <- x[boot_idx, ]
+    y_boot <- y[boot_idx]
+    
+    cv_fit_boot <- cv.glmnet(X_boot, y_boot, family = 'binomial', alpha = alp)
+    best_lambda_boot <- cv_fit_boot$lambda.min
+    fit_boot <- glmnet(X_boot, y_boot, family = 'binomial', alpha = alp, lambda = best_lambda_boot)
+    
+    selected_vars[b, ] <- as.numeric(fit_boot$beta != 0)
+  }
+  
+  # 변수 선택 확률 계산
+  selection_prob <- colMeans(selected_vars)
+  
+  # 선택 확률이 임계값(예: 0.5) 이상인 변수 선택
+  selected <- which(selection_prob >= 0.5)
+  
+  nvar_sp <- sum(selection_prob >= 0.5)
+  
+  #boot 에서 뽑힌 변수의 개수의 평균
+  SP_n_Elastic[i] <- sum(apply(selected_vars,1,sum))/B
+  
+  Result_Elastic[i,] = c(nvar_cv, nvar_ds, nvar_sp)
+}
+
+
+#SCAD
+
+Result_SCAD <- matrix(0, N, 3)
+SP_n_SCAD <- c(1:N)
+
+
+for(i in 1:N){
+  
+  #CV
+  set.seed(i)
+  # 10-fold 교차 검증을 사용한 라소 회귀
+  cv_model <- cv.ncvreg(as.matrix(x), y,seed = i , penalty = "SCAD", family = "binomial")
+  
+  # 최적의 람다 값
+  best_lambda_cv <- cv_model$lambda.min
+  
+  cv_model <- ncvreg(as.matrix(x), y, penalty = "SCAD", family = "binomial", lambda = best_lambda_cv)
+  
+  # 최적의 모델 계수
+  nvar_cv <- sum(cv_model$beta[-1,] != 0)
+  
+  
+  
+  #Ds
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x_ds <- x[train_indices, ]
+  test_x_ds <- x[-train_indices, ]
+  
+  train_y_ds <- y[train_indices]
+  test_y_ds <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- ncvreg(as.matrix(train_x_ds), train_y_ds, nlambda = 20, penalty = "SCAD", family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  ds_pred <- predict(ds_model, test_x_ds, type = 'response')
+  mse <- colMeans((ds_pred - as.numeric(test_y_ds)) ^ 2)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(ds_model$beta[-1, which.min(mse)] != 0)
+  
+  #Selection Probability
+  
+  # 부트스트랩 샘플 수
+  B <- 100
+  selected_vars <- matrix(0, ncol = ncol(x), nrow = B)
+  
+  # 부트스트랩 반복
+  for (b in 1:B) {
+    set.seed(123 + i + b)
+    boot_idx <- sample(1:nrow(x), size = nrow(x), replace = TRUE)
+    x_boot <- x[boot_idx, ]
+    y_boot <- y[boot_idx]
+    
+    fit_boot <- ncvreg(as.matrix(x_boot), y_boot, nlambda = 20, penalty = "SCAD", family = "binomial")
+    
+    # 테스트 세트에서 성능 평가
+    boot_pred <- predict(fit_boot, x, type = 'response')
+    mse <- colMeans((boot_pred - as.numeric(y)) ^ 2)
+    
+    selected_vars[b, ] <- as.numeric(fit_boot$beta[-1, which.min(mse)] != 0)
+  }
+  
+  
+  # 변수 선택 확률 계산
+  selection_prob <- colMeans(selected_vars)
+  
+  # 최적의 모델 계수
+  nvar_sp <- sum(selection_prob >= 0.5)
+  
+  #각 boot에서 뽑힌 변수의 개수 평균
+  SP_n_SCAD <- apply(selected_vars,1,sum)/100
+  
+  Result_SCAD[i,] = c(nvar_cv, nvar_ds,nvar_sp)
+}
+
+
+
+#MCP
+
+Result_MCP <- matrix(0, N, 3)
+SP_n_MCP <- c(1:N)
+
+
+for(i in 1:N){
+  
+  #CV
+  set.seed(i)
+  # 10-fold 교차 검증을 사용한 라소 회귀
+  cv_model <- cv.ncvreg(as.matrix(x), y,seed = i , penalty = "MCP", family = "binomial")
+  
+  # 최적의 람다 값
+  best_lambda_cv <- cv_model$lambda.min
+  
+  cv_model <- ncvreg(as.matrix(x), y, penalty = "MCP", family = "binomial", lambda = best_lambda_cv)
+  
+  # 최적의 모델 계수
+  nvar_cv <- sum(cv_model$beta[-1,] != 0)
+  
+  
+  
+  #Ds
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x_ds <- x[train_indices, ]
+  test_x_ds <- x[-train_indices, ]
+  
+  train_y_ds <- y[train_indices]
+  test_y_ds <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- ncvreg(as.matrix(train_x_ds), train_y_ds, nlambda = 20, penalty = "MCP", family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  ds_pred <- predict(ds_model, test_x_ds, type = 'response')
+  mse <- colMeans((ds_pred - as.numeric(test_y_ds)) ^ 2)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(ds_model$beta[-1, which.min(mse)] != 0)
+  
+  #Selection Probability
+  
+  # 부트스트랩 샘플 수
+  B <- 100
+  selected_vars <- matrix(0, ncol = ncol(x), nrow = B)
+  
+  # 부트스트랩 반복
+  for (b in 1:B) {
+    set.seed(123 + i + b)
+    boot_idx <- sample(1:nrow(x), size = nrow(x), replace = TRUE)
+    x_boot <- x[boot_idx, ]
+    y_boot <- y[boot_idx]
+    
+    fit_boot <- ncvreg(as.matrix(x_boot), nlambda = 20, y_boot, penalty = "MCP", family = "binomial")
+    
+    # 테스트 세트에서 성능 평가
+    boot_pred <- predict(fit_boot, x, type = 'response')
+    mse <- colMeans((boot_pred - as.numeric(y)) ^ 2)
+    
+    selected_vars[b, ] <- as.numeric(fit_boot$beta[-1, which.min(mse)] != 0)
+  }
+  
+  
+  # 변수 선택 확률 계산
+  selection_prob <- colMeans(selected_vars)
+  
+  # 최적의 모델 계수
+  nvar_sp <- sum(selection_prob >= 0.5)
+  
+  #각 boot에서 뽑힌 변수의 개수 평균
+  SP_n_MCP <- apply(selected_vars,1,sum)/100
+  
+  Result_MCP[i,] = c(nvar_cv, nvar_ds,nvar_sp)
+}

@@ -1,0 +1,121 @@
+g <- glmnet(as.matrix(x), y,alpha = 1, family = "binomial", nlambda = 20)
+lam <- g$lambda
+
+
+q_lambda <- numeric(length(lam))
+
+for (j in 1:K) {
+  s1 <- sample(1:n, floor(n/2))
+  g1 <- ncvreg(as.matrix(x), y, penalty = "SCAD", family = "binomial", lambda = lam)
+  bhat1 <- as.matrix(g1$beta[-1,])
+  bhat1[bhat1 != 0] <- 1
+  q_lambda <- q_lambda + colSums(bhat1)
+}
+
+q_lambda <- q_lambda / K
+
+# FDR 설정 및 θ 계산
+FDR <- 0.005  # 허용할 최대 오류 비율
+theta <- ceiling(FDR * p)  # 전체 변수 수의 5%를 θ로 설정
+
+# πθ 계산
+pi_theta <- (q_lambda^2) / (2 * theta * p) + 0.5
+Result_lasso <- matrix(0, N, 3)
+n_beta_cv <- numeric(p)
+n_beta_ds <- numeric(p)
+n_beta_sp <- numeric(p)
+lam_lasso <- NULL
+
+alp = 1
+
+
+for(i in 1:N){
+  
+  #CV
+  # 10-fold 교차 검증을 사용한 라소 회귀
+  set.seed(i)
+  cv_model <- cv.glmnet(as.matrix(x), y, family = "binomial", type.measure="class", alpha = alp, lambda = lam)
+  
+  # 최적의 람다 값
+  best_lambda_cv <- cv_model$lambda.min
+  
+  # 최적의 람다 값으로 모델 적합
+  final_model_cv <- glmnet(as.matrix(x), y, family = "binomial", alpha = alp, lambda = best_lambda_cv)
+  
+  # 최적의 모델 계수
+  nvar_cv <- sum(final_model_cv$beta != 0)
+  
+  n_beta_cv <- n_beta_cv + as.numeric(final_model_cv$beta != 0)
+  
+  lam_lasso <- c(lam_lasso, best_lambda_cv)
+  
+  #Ds
+  
+  train_indices <- sample(seq_len(nrow(x)), size = 0.7 * nrow(x))
+  train_x <- x[train_indices, ]
+  test_x <- x[-train_indices, ]
+  
+  train_y <- y[train_indices]
+  test_y <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- glmnet(train_x, train_y, family = "binomial", alpha = alp, lambda = lam)
+  
+  # 테스트 세트에서 성능 평가
+  dv_pred <- predict(ds_model, newx = test_x, type = 'response')
+  mse <- colMeans((dv_pred - as.numeric(test_y)) ^ 2)
+  
+  # 최적의 람다 값 선택
+  best_lambda_ds <- ds_model$lambda[which.min(mse)]
+  
+  # 최적의 람다 값으로 최종 모델 적합
+  final_model_ds <- glmnet(as.matrix(x), y, family = "binomial", alpha = alp, lambda = best_lambda_ds)
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta != 0)
+  
+  n_beta_ds <- n_beta_ds + as.numeric(final_model_ds$beta != 0)
+  
+  lam_lasso <- c(lam_lasso, lam[which.min(mse)])
+  
+  #SP
+  
+  # 선택 확률 기반 변수 선택
+  SF <- matrix(0, p, length(lam))
+  
+  for (j in 1:K) {
+    s1 <- sample(1:n, floor(n/2))
+    g1 <- glmnet(as.matrix(x[s1,]), y[s1], family = "binomial", alpha = alp, lambda = lam)
+    bhat1 <- as.matrix(g1$beta)
+    bhat1[bhat1 != 0] <- 1
+    SF <- SF + bhat1
+  }
+  
+  S <- SF / K
+  SP <- apply(S, 1, max)
+  
+  # 변수 선택
+  nvar_sp <- sum(SP >= pi_theta)
+  
+  n_beta_sp <- n_beta_sp + as.numeric(SP >= pi_theta)
+  
+  
+  Result_lasso[i,] = c(nvar_cv, nvar_ds, nvar_sp)
+  print(paste("Finish :", i))
+}
+
+Result_lasso
+lasso_beta_1 <- rbind(n_beta_cv,n_beta_ds,n_beta_sp)
+table(lam_lasso)
+
+hist(lam_lasso[seq(2, length(lam_lasso), by = 2)], main = 'DS : λ', xlab = 'λ', freq = F)
+hist(lam_lasso[-seq(2, length(lam_lasso), by = 2)], main = 'CV : λ', xlab = 'λ', freq = F)
+
+lasso_beta_1 <- lasso_beta_1/50
+lasso_beta_likelihood <- apply(lasso_beta_1,2,prod)
+colnames(x)[which(lasso_beta_likelihood != 0)]
+
+
+
+apply(Result_lasso,2,summary)
+apply(Result_lasso,2,sd)

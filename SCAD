@@ -1,0 +1,123 @@
+library(ncvreg)
+
+#SCAD
+library(ncvreg)
+
+# Original selection probabilities
+lam <- seq(0.05,0.35, length = 20)
+g <- ncvreg(as.matrix(x), y, penalty = "SCAD", family = "binomial", lambda =  lam)
+lam <- g$lambda
+
+q_lambda <- numeric(length(lam))
+
+for (j in 1:K) {
+  s1 <- sample(1:n, floor(n/2))
+  g1 <- ncvreg(as.matrix(x[s1,]), y[s1], penalty = "SCAD", family = "binomial", lambda = lam)
+  bhat1 <- as.matrix(g1$beta[-1,])
+  bhat1[bhat1 != 0] <- 1
+  q_lambda <- q_lambda + colSums(bhat1)
+}
+
+q_lambda <- q_lambda / K
+
+# FDR 설정 및 θ 계산
+FDR <- 0.005  # 허용할 최대 오류 비율
+theta <- ceiling(FDR * p)  # 전체 변수 수의 5%를 θ로 설정
+
+# πθ 계산
+pi_theta <- (q_lambda^2) / (2 * theta * p) + 0.5
+
+Result_SCAD <- matrix(0, N, 3)
+
+n_beta_cv <- numeric(p)
+n_beta_ds <- numeric(p)
+n_beta_sp <- numeric(p)
+
+lam_SCAD <- NULL
+
+for(i in 1:N){
+  
+  # 10-fold 교차 검증을 사용한 라소 회귀
+  cv_model <- cv.ncvreg(as.matrix(x), y, seed = 50*i, penalty = "SCAD", family = "binomial", lambda = lam)
+  
+  # 최적의 람다 값
+  best_lambda_cv <- cv_model$lambda.min
+  
+  final_model_cv <- ncvreg(as.matrix(x), y, penalty = "SCAD", family = "binomial", lambda = best_lambda_cv)
+  
+  # 최적의 모델 계수
+  nvar_cv <- sum(final_model_cv$beta[-1] != 0)
+  
+  n_beta_cv <- n_beta_cv + as.numeric(final_model_cv$beta[-1] != 0)
+  
+  lam_SCAD <- c(lam_SCAD, best_lambda_cv)
+
+  
+  #Ds
+  
+  train_indices <- sample(1:n, floor(0.7*n))
+  train_x_ds <- x[train_indices, ]
+  test_x_ds <- x[-train_indices, ]
+  
+  train_y_ds <- y[train_indices]
+  test_y_ds <- y[-train_indices]
+  
+  # 라소 회귀 모델 훈련
+  ds_model <- ncvreg(as.matrix(train_x_ds), train_y_ds, lambda = lam, penalty = "SCAD", family = "binomial")
+  
+  # 테스트 세트에서 성능 평가
+  ds_pred <- predict(ds_model, test_x_ds, type = 'response')
+  ds_pred <- ifelse(ds_pred > 0.5, 1, 0)
+  mse <- colMeans((ds_pred - as.numeric(test_y_ds)) ^ 2)
+  
+  # 최적의 모델 계수
+  final_model_ds <- ncvreg(as.matrix(x), y, lambda = lam[which.min(mse)], penalty = "SCAD", family = "binomial")
+  
+  # 최적의 모델 계수
+  nvar_ds <- sum(final_model_ds$beta[-1] != 0)
+  
+  n_beta_ds <- n_beta_ds + as.numeric(final_model_ds$beta[-1] != 0)
+  
+  lam_SCAD <- c(lam_SCAD, lam[which.min(mse)])
+
+  
+  #Selection Probability
+  
+  # 선택 확률 기반 변수 선택
+  SF <- matrix(0, p, length(lam))
+  
+  for (j in 1:K) {
+    s1 <- sample(1:n, floor(n/2))
+    g1 <- ncvreg(as.matrix(x[s1,]), y[s1], lambda = lam, penalty = "SCAD", family = "binomial")
+    bhat1 <- as.matrix(g1$beta[-1,])
+    bhat1[bhat1 != 0] <- 1
+    SF <- SF + bhat1
+  }
+  
+  S <- SF / K
+  SP <- apply(S, 1, max)
+  
+  # 변수 선택
+  nvar_sp <- sum(SP >= pi_theta)
+  
+  n_beta_sp <- n_beta_sp + as.numeric(SP >= pi_theta)
+  
+  Result_SCAD[i,] = c(nvar_cv, nvar_ds,nvar_sp)
+  print(paste("Finish :", i))
+}
+
+apply(Result_SCAD,2,summary)
+apply(Result_SCAD,2,sd)
+
+hist(lam_SCAD[seq(2, length(lam_SCAD), by = 2)], main = 'DS : λ', xlab = 'λ', freq = F)
+hist(lam_SCAD[-seq(2, length(lam_SCAD), by = 2)], main = 'CV : λ', xlab = 'λ', freq = F)
+
+SCAD_beta_1 <- rbind(n_beta_cv,n_beta_ds,n_beta_sp)
+
+order(SCAD_beta_1, decreasing = TRUE)[1:20]
+
+loc <- c(apply(Elastic_beta_1,2,mean) != 0 )
+
+SCAD_beta_1 <- SCAD_beta_1/50
+SCAD_beta_likelihood <- apply(SCAD_beta_1,2,prod)
+colnames(x)[which(SCAD_beta_likelihood != 0)]
